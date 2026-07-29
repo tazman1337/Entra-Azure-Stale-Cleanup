@@ -1,0 +1,6 @@
+DeviceId,DisplayName,Reason
+00000000-0000-0000-0000-000000000001,CONF-ROOM-LOBBY,Conference room display - seasonal use
+00000000-0000-0000-0000-000000000002,WAREHOUSE-PC-04,Seasonal warehouse terminal - winter only
+00000000-0000-0000-0000-000000000003,KIOSK-BREAK-ROOM,Break room kiosk - intermittent use
+00000000-0000-0000-0000-000000000004,EXEC-LAPTOP-SPARE,Executive spare laptop - kept for emergencies
+00000000-0000-0000-0000-000000000005,TRAINING-LAB-PC01,Training lab machine - used quarterly
