@@ -121,11 +121,11 @@ $authConfig = @{
 # Everything else is ignored entirely.
 
 $targetOS = @(
-    "Windows"
-    "macOS"
-    # "Android"    # Uncomment to include Android devices
-    # "iOS"        # Uncomment to include iPhones
-    # "iPadOS"     # Uncomment to include iPads
+    # "Windows"    # Uncomment to include Windows devices
+    # "macOS"      # Uncomment to include Mac devices
+     "Android"    # Uncomment to include Android devices
+     "iOS"        # Uncomment to include iPhones
+     "iPadOS"     # Uncomment to include iPads
     # "Linux"      # Uncomment to include Linux workstations
 )
 
@@ -199,7 +199,7 @@ $excludedOSVersionPatterns = @("*20348*")
 # Set $enableCsvExclusions = $false to skip the CSV file entirely.
 # File format: DeviceId,DisplayName,Reason (see exclusions.csv for examples)
 
-$enableCsvExclusions = $true
+$enableCsvExclusions = $false
 
 # ─── REPORT RETENTION / CLEANUP ──────────────────────────────────────────────
 # Automatically clean up old report files to prevent folder bloat.
@@ -363,8 +363,8 @@ function Invoke-ReportRetention {
     if (-not (Test-Path $ReportPath)) { return }
 
     $cutoffDate = $today.AddDays(-$reportRetentionDays)
-    $oldFiles = Get-ChildItem -Path $ReportPath -Include "*.csv", "*.json" -Recurse |
-        Where-Object { $_.LastWriteTime -lt $cutoffDate }
+    $oldFiles = @(Get-ChildItem -Path $ReportPath -Include "*.csv", "*.json" -Recurse |
+        Where-Object { $_.LastWriteTime -lt $cutoffDate })
 
     if ($oldFiles.Count -eq 0) {
         Write-Log "Report retention: No files older than $reportRetentionDays days" -Level "INFO"
@@ -605,7 +605,7 @@ if (-not (Test-Path $ReportPath)) {
 $script:exclusionList = $null
 if ($enableCsvExclusions) {
     if (Test-Path $ExclusionFile) {
-        $script:exclusionList = Import-Csv $ExclusionFile
+        $script:exclusionList = @(Import-Csv $ExclusionFile)
         Write-Log "Loaded $($script:exclusionList.Count) exclusion(s) from CSV" -Level "INFO"
     } else {
         Write-Log "CSV exclusion file not found at $ExclusionFile — proceeding without CSV exclusions" -Level "WARN"
@@ -688,8 +688,8 @@ Write-Log "--- STAGE 1: REPORT ---" -Level "INFO"
 
 try {
     Write-Log "Querying all devices from Entra ID (with owner expansion)..." -Level "INFO"
-    $allDevices = Get-MgDevice -All -ExpandProperty "RegisteredOwners" `
-        -Property "Id,DeviceId,DisplayName,OperatingSystem,OperatingSystemVersion,TrustType,AccountEnabled,ApproximateLastSignInDateTime,RegisteredOwners"
+    $allDevices = @(Get-MgDevice -All -ExpandProperty "RegisteredOwners" `
+        -Property "Id,DeviceId,DisplayName,OperatingSystem,OperatingSystemVersion,TrustType,AccountEnabled,ApproximateLastSignInDateTime,RegisteredOwners")
     Write-Log "Retrieved $($allDevices.Count) total devices" -Level "INFO"
 } catch {
     Write-Log "Failed to query devices: $($_.Exception.Message)" -Level "ERROR"
@@ -697,21 +697,21 @@ try {
 }
 
 # Filter to in-scope devices based on OS and trust type
-$inScope = $allDevices | Where-Object {
+$inScope = @($allDevices | Where-Object {
     ($targetOS -contains $_.OperatingSystem) -and
     (-not (Test-IsServer -OperatingSystem $_.OperatingSystem -OSVersion $_.OperatingSystemVersion -DisplayName $_.DisplayName)) -and
     ($corporateTrustTypes -contains $_.TrustType)
-}
+})
 Write-Log "In-scope devices after filtering: $($inScope.Count)" -Level "INFO"
 
 # Export filtered-out devices for audit trail (shows what was caught by server filters)
-$filteredOut = $allDevices | Where-Object {
+$filteredOut = @($allDevices | Where-Object {
     ($targetOS -contains $_.OperatingSystem) -and
     (Test-IsServer -OperatingSystem $_.OperatingSystem -OSVersion $_.OperatingSystemVersion -DisplayName $_.DisplayName) -and
     ($corporateTrustTypes -contains $_.TrustType)
-}
+})
 if ($filteredOut.Count -gt 0) {
-    $filteredReport = foreach ($d in $filteredOut) {
+    $filteredReport = @(foreach ($d in $filteredOut) {
         $reasons = @()
         foreach ($p in $excludedOSPatterns) { if ($d.OperatingSystem -like $p -or $d.OperatingSystemVersion -like $p) { $reasons += "OS: $p" } }
         foreach ($p in $excludedOSVersionPatterns) { if ($d.OperatingSystemVersion -like $p) { $reasons += "Build: $p" } }
@@ -727,20 +727,20 @@ if ($filteredOut.Count -gt 0) {
             Enabled        = $d.AccountEnabled
             FilterReason   = ($reasons -join "; ")
         }
-    }
+    })
     Export-Report -Data $filteredReport -FileName "FilteredDevices"
 }
 
 # Identify stale devices (no sign-in within threshold, or never signed in)
-$staleDevices = $inScope | Where-Object {
+$staleDevices = @($inScope | Where-Object {
     $lastSignIn = $_.ApproximateLastSignInDateTime
     if (-not $lastSignIn) { return $true }  # Never signed in = stale
     return ($lastSignIn -le $staleDate)
-}
+})
 Write-Log "Stale devices (inactive $StaleThreshold+ days): $($staleDevices.Count)" -Level "INFO"
 
 # Classify each stale device into lifecycle stages
-$staleReport = foreach ($d in $staleDevices) {
+$staleReport = @(foreach ($d in $staleDevices) {
     $id = $d.Id
     $lastSignIn = $d.ApproximateLastSignInDateTime
     $isExcluded = Test-IsExcluded -DeviceObjectId $id
@@ -775,15 +775,15 @@ $staleReport = foreach ($d in $staleDevices) {
         Reason            = $reason
         RunDate           = $today.ToString("yyyy-MM-dd HH:mm:ss")
     }
-}
+})
 
 Export-Report -Data $staleReport -FileName "StaleReport"
 
 # Summary counts
-$reportOnlyCount      = ($staleReport | Where-Object { $_.Action -eq "Reported" }).Count
-$disableEligibleCount = ($staleReport | Where-Object { $_.Action -eq "Disable-Eligible" }).Count
-$deleteEligibleCount  = ($staleReport | Where-Object { $_.Action -eq "Delete-Eligible" }).Count
-$excludedCount        = ($staleReport | Where-Object { $_.Action -eq "Excluded" }).Count
+$reportOnlyCount      = @($staleReport | Where-Object { $_.Action -eq "Reported" }).Count
+$disableEligibleCount = @($staleReport | Where-Object { $_.Action -eq "Disable-Eligible" }).Count
+$deleteEligibleCount  = @($staleReport | Where-Object { $_.Action -eq "Delete-Eligible" }).Count
+$excludedCount        = @($staleReport | Where-Object { $_.Action -eq "Excluded" }).Count
 
 Write-Log "  Report-only (grace period): $reportOnlyCount" -Level "INFO"
 Write-Log "  Eligible for disable: $disableEligibleCount" -Level "INFO"
@@ -797,7 +797,7 @@ Write-Log "  Excluded (protected): $excludedCount" -Level "INFO"
 Write-Log "" -Level "INFO"
 Write-Log "--- STAGE 2: DISABLE ---" -Level "INFO"
 
-$toDisable = $staleReport | Where-Object { $_.Action -eq "Disable-Eligible" -and $_.AccountEnabled -eq $true }
+$toDisable = @($staleReport | Where-Object { $_.Action -eq "Disable-Eligible" -and $_.AccountEnabled -eq $true })
 Write-Log "Devices to disable (currently enabled): $($toDisable.Count)" -Level "INFO"
 
 $disabledCount = 0
@@ -851,7 +851,7 @@ if ($Execute -and ($disabledCount + $disableFailures) -gt 0) {
 Write-Log "" -Level "INFO"
 Write-Log "--- STAGE 3: DELETE ---" -Level "INFO"
 
-$toDelete = $staleReport | Where-Object { $_.Action -eq "Delete-Eligible" }
+$toDelete = @($staleReport | Where-Object { $_.Action -eq "Delete-Eligible" })
 Write-Log "Devices eligible for deletion: $($toDelete.Count)" -Level "INFO"
 
 $deletedCount = 0
