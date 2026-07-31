@@ -53,7 +53,7 @@
 
 .NOTES
     Author:  Mitchell Brown
-    Version: 2.0
+    Version: 2.1
     Requires: PowerShell 7+ and Microsoft.Graph module v2.0+
     License: MIT — Use at your own risk. No warranty expressed or implied.
              The author is not responsible for any damage, data loss, or
@@ -68,7 +68,7 @@
     4. Update USER CONFIGURATION region with TenantId, ClientId, ClientSecret
 #>
 
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
     [switch]$Execute,
     [switch]$DeleteEnabled,
@@ -128,6 +128,21 @@ $targetOS = @(
      "iPadOS"     # Uncomment to include iPads
     # "Linux"      # Uncomment to include Linux workstations
 )
+
+# ─── OS VARIANT MAP (Internal — handles Entra ID reporting inconsistencies) ──
+# Entra ID reports mobile OS names inconsistently across tenants.
+# This map expands the clean $targetOS values into all known variants
+# so users don't need to guess what their tenant reports.
+# Add new variants here as Microsoft introduces them.
+
+$osVariantMap = @{
+    "Windows"  = @("Windows")
+    "macOS"    = @("macOS")
+    "Android"  = @("Android", "AndroidForWork", "AndroidEnterprise", "AOSP")
+    "iOS"      = @("iOS", "iPhone")
+    "iPadOS"   = @("iPadOS", "iPad")
+    "Linux"    = @("Linux")
+}
 
 # ─── DEVICE TRUST TYPES ──────────────────────────────────────────────────────
 # Controls which join types are in scope. This determines whether you're
@@ -201,6 +216,32 @@ $excludedOSVersionPatterns = @("*20348*")
 
 $enableCsvExclusions = $false
 
+# ─── RE-ENABLE PROTECTION (Extension Attribute Stamp) ────────────────────────
+# When the script disables a device, it stamps an extension attribute to
+# track that it was disabled by THIS script. If a human re-enables the device,
+# the next run detects the stamp on an enabled device and SKIPS it — respecting
+# the operator's intentional decision.
+#
+# Set $enableReEnableProtection = $false to disable this feature entirely.
+# (Script will behave as before — re-disable anything that meets stale criteria.)
+#
+# The extension attribute is configurable in case your environment already uses
+# some of the 15 available extension attributes for other purposes.
+# Check Entra ID > Devices > [any device] > Extension Attributes to see what's
+# in use in your tenant before choosing.
+#
+# Stamp format written: "StaleLifecycle|YYYY-MM-DD" (date device was disabled)
+# Stamp cleared: Set to empty string when re-enable is detected
+#
+# NOTE: Requires write permission to device extension attributes.
+#       If permission is missing, the script logs a warning and continues
+#       WITHOUT stamping — disable operations still work, just without protection.
+#       This feature is completely isolated and never blocks core operations.
+
+$enableReEnableProtection = $true
+$lifecycleAttribute       = "extensionAttribute15"   # Change if this attribute is in use
+$lifecycleStampPrefix     = "StaleLifecycle"         # Prefix for identifying our stamps
+
 # ─── REPORT RETENTION / CLEANUP ──────────────────────────────────────────────
 # Automatically clean up old report files to prevent folder bloat.
 # Set $enableReportRetention = $true to turn on cleanup.
@@ -216,23 +257,36 @@ $enableReportRetention = $true
 $reportRetentionDays = 30
 
 # ─── GRAPH API BATCH CONFIGURATION ───────────────────────────────────────────
-# The script sends disable/delete requests in batches to the Graph API.
-# These settings control batch behavior — tune them based on your tenant size
-# and throttling tolerance.
+# The script uses the GraphBatchEngine for all bulk Graph API operations.
+# These variables control adaptive throttling behavior — tune them based on
+# your tenant size and throttling tolerance.
 #
-# BatchSize: How many requests per batch (Graph API max is 20)
-# MaxRetries: How many times to retry a failed batch before giving up
-# PauseBetweenBatchesMs: Milliseconds to wait between batches (throttle prevention)
+# BatchSize: Requests per batch (Graph API max is 20, 10 is safe default)
+# InitialDelay: Starting delay between batches in seconds
+# MinDelay/MaxDelay: Floor and ceiling for adaptive delay
+# CleanThreshold: Consecutive clean batches before delay halves
+# MaxRetryPasses: Retry rounds for failed/throttled requests
+# ApiVersion: 'v1.0' or 'beta' — use v1.0 for device operations
 #
-# Conservative (large tenants, cautious): BatchSize=10, Pause=500
-# Balanced (most environments):          BatchSize=20, Pause=200
-# Aggressive (small tenants, fast):       BatchSize=20, Pause=100
+# Conservative (large tenants): BatchSize=10, InitialDelay=2, MaxDelay=30
+# Balanced (most environments): BatchSize=10, InitialDelay=1, MaxDelay=30
+# Aggressive (small tenants):   BatchSize=20, InitialDelay=1, MaxDelay=15
 
-$batchConfig = @{
-    BatchSize              = 20      # Requests per batch (max 20 per Graph API limit)
-    MaxRetries             = 3       # Retry attempts for transient failures (429, 503, 504)
-    PauseBetweenBatchesMs  = 200     # Milliseconds between batches to avoid throttling
-}
+$GraphBatch_BatchSize       = 10       # Requests per batch (max 20, 10 is safe)
+$GraphBatch_InitialDelay    = 1        # Starting delay between batches (seconds)
+$GraphBatch_MinDelay        = 1        # Floor — delay won't go below this
+$GraphBatch_MaxDelay        = 30       # Ceiling — delay won't exceed this
+$GraphBatch_CleanThreshold  = 5        # Clean batches before delay halves
+$GraphBatch_MaxRetryPasses  = 3        # Retry rounds for failed requests
+$GraphBatch_ApiVersion      = 'v1.0'   # Use v1.0 for device operations
+$GraphBatch_Quiet           = $true    # $true = suppress engine console output (use Write-Log instead)
+
+# ─── GRAPH QUERY PAGINATION ──────────────────────────────────────────────────
+# Page size for device retrieval. Larger pages = fewer API calls but more memory
+# per page. Devices are filtered in-flight — only matching devices stay in memory.
+# 500 is the maximum for the /devices endpoint in Microsoft Graph.
+
+$deviceQueryPageSize = 500
 
 # ─── EMAIL NOTIFICATION (Optional) ───────────────────────────────────────────
 # Sends an HTML summary email after each run. OFF by default.
@@ -317,17 +371,68 @@ function Get-ExclusionReason {
     return "N/A"
 }
 
+function Get-LifecycleStamp {
+    <#
+    .SYNOPSIS
+        Reads the lifecycle stamp from a device's extension attribute.
+    .DESCRIPTION
+        Returns the stamp string if present, or $null if empty/missing.
+    #>
+    param([object]$Device)
+    if (-not $enableReEnableProtection) { return $null }
+
+    $extProps = $Device.AdditionalProperties
+    if ($extProps -and $extProps.ContainsKey($lifecycleAttribute)) {
+        $value = $extProps[$lifecycleAttribute]
+        if ($value -and $value.StartsWith($lifecycleStampPrefix)) {
+            return $value
+        }
+    }
+    return $null
+}
+
+function New-LifecycleStamp {
+    <#
+    .SYNOPSIS
+        Generates the stamp string to write when disabling a device.
+    #>
+    return "$lifecycleStampPrefix|$($today.ToString('yyyy-MM-dd'))"
+}
+
+function Test-WasReEnabled {
+    <#
+    .SYNOPSIS
+        Checks if a device was disabled by this script but has since been re-enabled.
+    .DESCRIPTION
+        Returns $true if: device has our stamp AND is currently enabled.
+        This means a human intervened — we should respect their decision.
+    #>
+    param([object]$Device)
+    if (-not $enableReEnableProtection) { return $false }
+
+    $stamp = Get-LifecycleStamp -Device $Device
+    $isEnabled = $Device.AccountEnabled
+
+    return ($null -ne $stamp -and $isEnabled -eq $true)
+}
+
 function Get-DeviceOwnerName {
     param([object]$Device)
-    # RegisteredOwners is expanded as a navigation property from Graph
+    # RegisteredOwners comes from $expand in the Graph request
     $owners = $Device.RegisteredOwners
     if ($owners -and $owners.Count -gt 0) {
         $ownerNames = foreach ($owner in $owners) {
-            $props = $owner.AdditionalProperties
-            if ($props -and $props.ContainsKey('displayName')) {
-                $props['displayName']
-            } elseif ($props -and $props.ContainsKey('userPrincipalName')) {
-                $props['userPrincipalName']
+            # Raw Graph response: properties are direct on the object
+            if ($owner.displayName) {
+                $owner.displayName
+            } elseif ($owner.userPrincipalName) {
+                $owner.userPrincipalName
+            }
+            # Fallback for Get-MgDevice format (AdditionalProperties)
+            elseif ($owner.AdditionalProperties) {
+                $props = $owner.AdditionalProperties
+                if ($props.ContainsKey('displayName')) { $props['displayName'] }
+                elseif ($props.ContainsKey('userPrincipalName')) { $props['userPrincipalName'] }
             }
         }
         return ($ownerNames -join "; ")
@@ -382,117 +487,181 @@ function Invoke-ReportRetention {
     }
 }
 
-function Invoke-GraphBatch {
-    <#
-    .SYNOPSIS
-        Sends Graph API requests in JSON batches of up to $batchConfig.BatchSize.
-    .DESCRIPTION
-        Accepts an array of request objects (id, method, url, optional body/headers),
-        splits them into configurable batches, submits each via the $batch endpoint,
-        and returns per-request results with success/failure status.
+# ─── GRAPH BATCH ENGINE (embedded from Tools/GraphBatchEngine) ────────────────
+# Adaptive batch pipeline with retry queues and throttle management.
+# Source: Mitch_Scripts/Personal/GraphBatchEngine/Invoke-GraphBatchRequest.ps1
 
-        Includes retry logic for transient failures (429, 503, 504).
+$script:_GBE_Delay       = $GraphBatch_InitialDelay
+$script:_GBE_CleanStreak = 0
+$script:_GBE_ThrottleLog = @()
 
-        Batch behavior is controlled by the $batchConfig hashtable in the
-        USER CONFIGURATION section:
-          - BatchSize: requests per batch (max 20)
-          - MaxRetries: retry attempts for failed batches
-          - PauseBetweenBatchesMs: delay between batches to prevent throttling
-    #>
-    param(
-        [Parameter(Mandatory)]
-        [array]$Requests
-    )
+function Update-GraphBatchDelay {
+    param([parameter(Mandatory)][bool]$WasThrottled)
 
-    $BatchSize = $batchConfig.BatchSize
-    $MaxRetries = $batchConfig.MaxRetries
-    $PauseBetweenBatchesMs = $batchConfig.PauseBetweenBatchesMs
-
-    $totalBatches = [Math]::Ceiling($Requests.Count / $BatchSize)
-    $allResults = [System.Collections.Generic.List[object]]::new()
-    $successCount = 0
-    $failCount = 0
-
-    Write-Log "Graph Batch: $($Requests.Count) requests in $totalBatches batch(es) [size=$BatchSize, retries=$MaxRetries, pause=${PauseBetweenBatchesMs}ms]" -Level "INFO"
-
-    for ($i = 0; $i -lt $totalBatches; $i++) {
-        $start = $i * $BatchSize
-        $end = [Math]::Min($start + $BatchSize - 1, $Requests.Count - 1)
-        $currentBatch = $Requests[$start..$end]
-
-        $batchBody = @{ requests = $currentBatch } | ConvertTo-Json -Depth 10 -Compress
-
-        $attempt = 0
-        $batchSuccess = $false
-
-        while (-not $batchSuccess -and $attempt -lt $MaxRetries) {
-            $attempt++
-            try {
-                $response = Invoke-MgGraphRequest -Method POST `
-                    -Uri 'https://graph.microsoft.com/v1.0/$batch' `
-                    -Body $batchBody -ContentType "application/json" -ErrorAction Stop
-
-                foreach ($result in $response.responses) {
-                    $reqId = $result.id
-                    $originalReq = $currentBatch | Where-Object { $_.id -eq $reqId }
-
-                    if ($result.status -ge 400) {
-                        $errorMsg = if ($result.body.error) { $result.body.error.message } else { "HTTP $($result.status)" }
-
-                        if ($result.status -in @(429, 503, 504) -and $attempt -lt $MaxRetries) {
-                            continue
-                        }
-
-                        $allResults.Add([PSCustomObject]@{
-                            Id      = $reqId
-                            Status  = $result.status
-                            Success = $false
-                            Error   = $errorMsg
-                            Url     = $originalReq.url
-                        })
-                        $failCount++
-                    } else {
-                        $allResults.Add([PSCustomObject]@{
-                            Id      = $reqId
-                            Status  = $result.status
-                            Success = $true
-                            Error   = $null
-                            Url     = $originalReq.url
-                        })
-                        $successCount++
-                    }
-                }
-                $batchSuccess = $true
-
-            } catch {
-                if ($attempt -lt $MaxRetries) {
-                    $retryDelay = $attempt * 2
-                    Write-Log "Batch $($i+1) attempt $attempt failed: $($_.Exception.Message). Retrying in ${retryDelay}s..." -Level "WARN"
-                    Start-Sleep -Seconds $retryDelay
-                } else {
-                    Write-Log "Batch $($i+1) FAILED after $MaxRetries attempts: $($_.Exception.Message)" -Level "ERROR"
-                    foreach ($req in $currentBatch) {
-                        $allResults.Add([PSCustomObject]@{
-                            Id      = $req.id
-                            Status  = 0
-                            Success = $false
-                            Error   = "Batch submission failed: $($_.Exception.Message)"
-                            Url     = $req.url
-                        })
-                        $failCount++
-                    }
-                }
-            }
+    if ($WasThrottled) {
+        $script:_GBE_Delay = [math]::Min($script:_GBE_Delay * 2, $GraphBatch_MaxDelay)
+        $script:_GBE_CleanStreak = 0
+        if (-not $GraphBatch_Quiet) {
+            Write-Host "    [THROTTLE] Delay increased to $($script:_GBE_Delay)s" -ForegroundColor DarkYellow
         }
-
-        # Pause between batches to avoid throttling
-        if ($i -lt ($totalBatches - 1)) {
-            Start-Sleep -Milliseconds $PauseBetweenBatchesMs
+    } else {
+        $script:_GBE_CleanStreak++
+        if ($script:_GBE_CleanStreak -ge $GraphBatch_CleanThreshold) {
+            $script:_GBE_Delay = [math]::Max([math]::Floor($script:_GBE_Delay / 2), $GraphBatch_MinDelay)
+            $script:_GBE_CleanStreak = 0
+            if (-not $GraphBatch_Quiet) {
+                Write-Host "    [FAST] Clean streak - delay reduced to $($script:_GBE_Delay)s" -ForegroundColor DarkGreen
+            }
         }
     }
 
-    Write-Log "Graph Batch complete: $successCount succeeded, $failCount failed" -Level "INFO"
-    return $allResults
+    $script:_GBE_ThrottleLog += [PSCustomObject]@{
+        Timestamp = (Get-Date)
+        Delay     = $script:_GBE_Delay
+        Throttled = $WasThrottled
+    }
+}
+
+function Send-GraphBatch {
+    param([parameter(Mandatory)][array]$Requests)
+
+    $batchBody = @{ requests = $Requests } | ConvertTo-Json -Depth 10
+    $output = @{ results = @(); retryItems = @(); throttled = $false }
+
+    try {
+        $response = Invoke-MgGraphRequest -Method POST `
+            -Uri "https://graph.microsoft.com/$GraphBatch_ApiVersion/`$batch" `
+            -Body $batchBody -ContentType 'application/json' -OutputType PSObject
+
+        foreach ($resp in $response.responses) {
+            if ($resp.status -eq 429) {
+                $output.throttled = $true
+                $matched = $Requests | Where-Object { $_.id -eq $resp.id }
+                $output.retryItems += $matched
+            } elseif ($resp.status -ge 200 -and $resp.status -lt 300) {
+                $output.results += [PSCustomObject]@{
+                    id     = $resp.id
+                    status = $resp.status
+                    body   = $resp.body
+                }
+            } else {
+                $matched = $Requests | Where-Object { $_.id -eq $resp.id }
+                $output.retryItems += $matched
+                if (-not $GraphBatch_Quiet) {
+                    Write-Warning "    HTTP $($resp.status) for request '$($resp.id)' - queued for retry"
+                }
+            }
+        }
+    } catch {
+        if (-not $GraphBatch_Quiet) {
+            Write-Warning "    Batch failed: $_ - queuing all for retry"
+        }
+        $output.throttled = $true
+        $output.retryItems += $Requests
+    }
+
+    return $output
+}
+
+function Invoke-GraphBatchRequest {
+    param([parameter(Mandatory)][hashtable[]]$Requests)
+
+    # Reset state for this run
+    $script:_GBE_Delay       = $GraphBatch_InitialDelay
+    $script:_GBE_CleanStreak = 0
+    $script:_GBE_ThrottleLog = @()
+
+    $successResults = @()
+    $failedResults  = @()
+    $retryQueue     = @()
+    $totalBatches   = [math]::Ceiling($Requests.Count / $GraphBatch_BatchSize)
+
+    if (-not $GraphBatch_Quiet) {
+        Write-Host "[GraphBatch] $($Requests.Count) requests | $totalBatches batches | size $GraphBatch_BatchSize | delay $($script:_GBE_Delay)s" -ForegroundColor Cyan
+    }
+
+    # Main pass
+    for ($i = 0; $i -lt $Requests.Count; $i += $GraphBatch_BatchSize) {
+        $batchNum = [math]::Floor($i / $GraphBatch_BatchSize) + 1
+        $chunk = $Requests[$i..([math]::Min($i + $GraphBatch_BatchSize - 1, $Requests.Count - 1))]
+
+        if (-not $GraphBatch_Quiet) {
+            Write-Host "    Batch $batchNum/$totalBatches ($($chunk.Count) req) [delay: $($script:_GBE_Delay)s]" -ForegroundColor Gray
+        }
+
+        $result = Send-GraphBatch -Requests $chunk
+        $successResults += $result.results
+        $retryQueue     += $result.retryItems
+
+        Update-GraphBatchDelay -WasThrottled $result.throttled
+
+        if ($i + $GraphBatch_BatchSize -lt $Requests.Count) {
+            Start-Sleep -Seconds $script:_GBE_Delay
+        }
+    }
+
+    # Retry passes
+    if ($retryQueue.Count -gt 0) {
+        if (-not $GraphBatch_Quiet) {
+            Write-Host "    [RETRY] $($retryQueue.Count) request(s) queued for retry..." -ForegroundColor Yellow
+        }
+
+        for ($pass = 1; $pass -le $GraphBatch_MaxRetryPasses; $pass++) {
+            if ($retryQueue.Count -eq 0) { break }
+
+            $retryWait = [math]::Max($script:_GBE_Delay, 10) * $pass
+            if (-not $GraphBatch_Quiet) {
+                Write-Host "    Retry $pass/$GraphBatch_MaxRetryPasses ($($retryQueue.Count) left) - waiting ${retryWait}s" -ForegroundColor Yellow
+            }
+            Start-Sleep -Seconds $retryWait
+
+            $stillFailed = @()
+            for ($i = 0; $i -lt $retryQueue.Count; $i += $GraphBatch_BatchSize) {
+                $chunk = $retryQueue[$i..([math]::Min($i + $GraphBatch_BatchSize - 1, $retryQueue.Count - 1))]
+
+                $result = Send-GraphBatch -Requests $chunk
+                $successResults += $result.results
+                $stillFailed    += $result.retryItems
+
+                Update-GraphBatchDelay -WasThrottled $result.throttled
+
+                if ($i + $GraphBatch_BatchSize -lt $retryQueue.Count) {
+                    Start-Sleep -Seconds $script:_GBE_Delay
+                }
+            }
+
+            $retryQueue = $stillFailed
+        }
+
+        # Anything left is a hard failure
+        foreach ($failed in $retryQueue) {
+            $failedResults += [PSCustomObject]@{
+                id      = $failed.id
+                request = $failed
+                reason  = 'FailedAfterRetries'
+            }
+        }
+    }
+
+    # Return structured result
+    $throttledCount = ($script:_GBE_ThrottleLog | Where-Object { $_.Throttled }).Count
+
+    if (-not $GraphBatch_Quiet) {
+        Write-Host "[GraphBatch] Done: $($successResults.Count) OK, $($failedResults.Count) failed, $throttledCount throttle events." -ForegroundColor Cyan
+    }
+
+    return [PSCustomObject]@{
+        Results     = $successResults
+        Failures    = $failedResults
+        ThrottleLog = $script:_GBE_ThrottleLog
+        Summary     = @{
+            TotalRequests  = $Requests.Count
+            Succeeded      = $successResults.Count
+            Failed         = $failedResults.Count
+            TotalBatches   = $totalBatches
+            ThrottleEvents = $throttledCount
+        }
+    }
 }
 
 function Send-SummaryEmail {
@@ -586,13 +755,46 @@ Write-Log "Stale Threshold: $StaleThreshold days (inactive since $($staleDate.To
 Write-Log "Grace Period: $GracePeriod days (disable eligible since $($disableEligibleDate.ToString('yyyy-MM-dd')))" -Level "INFO"
 Write-Log "Disable Hold: $DisableHold days (delete eligible since $($deleteEligibleDate.ToString('yyyy-MM-dd')))" -Level "INFO"
 Write-Log "Report Path: $ReportPath" -Level "INFO"
-Write-Log "Batch Config: Size=$($batchConfig.BatchSize), Retries=$($batchConfig.MaxRetries), Pause=$($batchConfig.PauseBetweenBatchesMs)ms" -Level "INFO"
+Write-Log "Batch Config: Size=$GraphBatch_BatchSize, Retries=$GraphBatch_MaxRetryPasses, InitDelay=${GraphBatch_InitialDelay}s, MaxDelay=${GraphBatch_MaxDelay}s (adaptive)" -Level "INFO"
 Write-Log "Report Retention: $(if ($enableReportRetention) { "$reportRetentionDays days" } else { 'DISABLED' })" -Level "INFO"
 
 # Validate flags
 if ($DeleteEnabled -and -not $Execute) {
     Write-Log "-DeleteEnabled requires -Execute. Delete operations will NOT run." -Level "WARN"
     $DeleteEnabled = $false
+}
+
+# ShouldProcess state (enables -WhatIf and -Confirm awareness)
+if ($WhatIfPreference) {
+    Write-Log "WhatIf: ACTIVE — no changes will be made (showing what would happen)" -Level "DRYRUN"
+}
+
+# Resolve OS targets to all known Entra ID variant names
+$resolvedOSValues = @(foreach ($os in $targetOS) {
+    if ($osVariantMap.ContainsKey($os)) {
+        $osVariantMap[$os]
+    } else {
+        $os  # Pass through unknown values as-is (future-proof)
+    }
+})
+Write-Log "Resolved OS targets: $($resolvedOSValues -join ', ')" -Level "INFO"
+
+# Auto-expand trust types when mobile OS is targeted
+# Mobile devices register as "Workplace" in Entra, not "AzureAd"
+$mobileOSKeys = @("Android", "iOS", "iPadOS")
+$hasMobileTargets = @($targetOS | Where-Object { $mobileOSKeys -contains $_ }).Count -gt 0
+
+if ($hasMobileTargets -and "Workplace" -notin $corporateTrustTypes) {
+    Write-Log "Mobile OS targeted but 'Workplace' trust type not in scope — auto-adding" -Level "WARN"
+    Write-Log "  (Mobile devices register as 'Workplace' in Entra ID, not 'AzureAd')" -Level "WARN"
+    $corporateTrustTypes += "Workplace"
+}
+
+# Re-enable protection state
+$script:stampsToClear = @()
+if ($enableReEnableProtection) {
+    Write-Log "Re-enable protection: ENABLED (using $lifecycleAttribute)" -Level "INFO"
+    Write-Log "  Stamp format: '$lifecycleStampPrefix|YYYY-MM-DD'" -Level "INFO"
 }
 
 # Create report directory
@@ -687,30 +889,97 @@ Write-Log "" -Level "INFO"
 Write-Log "--- STAGE 1: REPORT ---" -Level "INFO"
 
 try {
-    Write-Log "Querying all devices from Entra ID (with owner expansion)..." -Level "INFO"
-    $allDevices = @(Get-MgDevice -All -ExpandProperty "RegisteredOwners" `
-        -Property "Id,DeviceId,DisplayName,OperatingSystem,OperatingSystemVersion,TrustType,AccountEnabled,ApproximateLastSignInDateTime,RegisteredOwners")
-    Write-Log "Retrieved $($allDevices.Count) total devices" -Level "INFO"
+    Write-Log "Querying devices from Entra ID (paged, $deviceQueryPageSize per page)..." -Level "INFO"
+
+    $inScope = [System.Collections.Generic.List[object]]::new()
+    $filteredOut = [System.Collections.Generic.List[object]]::new()
+    $totalDevicesSeen = 0
+    $pageCount = 0
+
+    # Build initial request URI with select and expand
+    $selectProperties = @(
+        "id", "deviceId", "displayName", "operatingSystem", "operatingSystemVersion",
+        "trustType", "accountEnabled", "approximateLastSignInDateTime", "createdDateTime"
+    )
+    # Add extensionAttributes complex property if re-enable protection is on
+    if ($enableReEnableProtection) {
+        $selectProperties += "extensionAttributes"
+    }
+    $selectString = $selectProperties -join ','
+    $graphUri = "https://graph.microsoft.com/v1.0/devices?`$top=$deviceQueryPageSize&`$select=$selectString&`$expand=registeredOwners(`$select=displayName,userPrincipalName)"
+
+    # Page through all devices — filter in-flight, discard the rest
+    do {
+        $pageCount++
+        $response = Invoke-MgGraphRequest -Method GET -Uri $graphUri -OutputType PSObject
+
+        $pageDevices = $response.value
+        $totalDevicesSeen += $pageDevices.Count
+
+        foreach ($d in $pageDevices) {
+            # First gate: OS match (fast check — skip everything that's not our target)
+            if ($resolvedOSValues -notcontains $d.operatingSystem) { continue }
+
+            # Second gate: Trust type
+            if ($corporateTrustTypes -notcontains $d.trustType) { continue }
+
+            # Normalize to PascalCase PSCustomObject (avoids touching all downstream code)
+            $normalized = [PSCustomObject]@{
+                Id                              = $d.id
+                DeviceId                        = $d.id  # Graph v1.0 /devices uses 'id' as the object identifier
+                DisplayName                     = $d.displayName
+                OperatingSystem                 = $d.operatingSystem
+                OperatingSystemVersion          = $d.operatingSystemVersion
+                TrustType                       = $d.trustType
+                AccountEnabled                  = $d.accountEnabled
+                ApproximateLastSignInDateTime   = if ($d.approximateLastSignInDateTime -is [string] -and $d.approximateLastSignInDateTime) {
+                    [datetime]::Parse($d.approximateLastSignInDateTime)
+                } else { $d.approximateLastSignInDateTime }
+                CreatedDateTime                 = if ($d.createdDateTime -is [string] -and $d.createdDateTime) {
+                    [datetime]::Parse($d.createdDateTime)
+                } else { $d.createdDateTime }
+                RegisteredOwners                = $d.registeredOwners
+                AdditionalProperties            = @{
+                    $lifecycleAttribute = if ($enableReEnableProtection -and $d.extensionAttributes) {
+                        $d.extensionAttributes.$lifecycleAttribute
+                    } else { $null }
+                }
+            }
+
+            # Third gate: Server exclusion
+            $isServer = Test-IsServer `
+                -OperatingSystem $normalized.OperatingSystem `
+                -OSVersion $normalized.OperatingSystemVersion `
+                -DisplayName $normalized.DisplayName
+
+            if ($isServer) {
+                $filteredOut.Add($normalized)
+            } else {
+                $inScope.Add($normalized)
+            }
+        }
+
+        # Progress logging every 5 pages
+        if ($pageCount % 5 -eq 0) {
+            Write-Log "  Paging: $totalDevicesSeen devices scanned, $($inScope.Count) in-scope so far..." -Level "INFO"
+        }
+
+        # Get next page URL (null on last page — loop exits)
+        $graphUri = if ($response.PSObject.Properties['@odata.nextLink']) { $response.'@odata.nextLink' } else { $null }
+
+    } while ($graphUri)
+
+    Write-Log "Device query complete: $totalDevicesSeen total scanned across $pageCount page(s)" -Level "INFO"
+    Write-Log "In-scope devices after filtering: $($inScope.Count)" -Level "INFO"
+
 } catch {
     Write-Log "Failed to query devices: $($_.Exception.Message)" -Level "ERROR"
     throw
 }
 
-# Filter to in-scope devices based on OS and trust type
-$inScope = @($allDevices | Where-Object {
-    ($targetOS -contains $_.OperatingSystem) -and
-    (-not (Test-IsServer -OperatingSystem $_.OperatingSystem -OSVersion $_.OperatingSystemVersion -DisplayName $_.DisplayName)) -and
-    ($corporateTrustTypes -contains $_.TrustType)
-})
-Write-Log "In-scope devices after filtering: $($inScope.Count)" -Level "INFO"
-
 # Export filtered-out devices for audit trail (shows what was caught by server filters)
-$filteredOut = @($allDevices | Where-Object {
-    ($targetOS -contains $_.OperatingSystem) -and
-    (Test-IsServer -OperatingSystem $_.OperatingSystem -OSVersion $_.OperatingSystemVersion -DisplayName $_.DisplayName) -and
-    ($corporateTrustTypes -contains $_.TrustType)
-})
 if ($filteredOut.Count -gt 0) {
+    Write-Log "Server-filtered devices: $($filteredOut.Count) (excluded by name/OS/build patterns)" -Level "INFO"
     $filteredReport = @(foreach ($d in $filteredOut) {
         $reasons = @()
         foreach ($p in $excludedOSPatterns) { if ($d.OperatingSystem -like $p -or $d.OperatingSystemVersion -like $p) { $reasons += "OS: $p" } }
@@ -748,15 +1017,43 @@ $staleReport = @(foreach ($d in $staleDevices) {
     $owner = Get-DeviceOwnerName -Device $d
 
     # Determine action classification
-    if ($isExcluded) {
+    # ─── Re-enable protection check (before normal classification) ───
+    if (Test-WasReEnabled -Device $d) {
+        $action = "Skipped-ReEnabled"
+        $reason = "Device was disabled by lifecycle script but re-enabled by operator — respecting intervention"
+        Write-Log "  SKIP (re-enabled): $($d.DisplayName) — operator override detected" -Level "WARN"
+
+        # Queue stamp clearing (handled after classification loop)
+        if ($Execute) {
+            $script:stampsToClear += $id
+        }
+    }
+    # ─── Normal classification cascade ───
+    elseif ($isExcluded) {
         $action = "Excluded"
         $reason = Get-ExclusionReason -DeviceObjectId $id
     } elseif ($lastSignIn -and $lastSignIn -le $deleteEligibleDate -and $isDisabled) {
         $action = "Delete-Eligible"
         $reason = "Disabled and inactive $($StaleThreshold + $GracePeriod + $DisableHold)+ days"
-    } elseif (($lastSignIn -and $lastSignIn -le $disableEligibleDate) -or (-not $lastSignIn -and -not $isDisabled)) {
+    } elseif ($lastSignIn -and $lastSignIn -le $disableEligibleDate) {
         $action = "Disable-Eligible"
-        $reason = if (-not $lastSignIn) { "No sign-in ever recorded" } else { "Inactive $($StaleThreshold + $GracePeriod)+ days" }
+        $reason = "Inactive $($StaleThreshold + $GracePeriod)+ days"
+    } elseif (-not $lastSignIn -and -not $isDisabled) {
+        # Never signed in — check creation date before acting
+        $createdDate = $d.CreatedDateTime
+        if ($createdDate -and $createdDate -gt $staleDate) {
+            # Device is younger than the stale threshold — too new to evaluate
+            $action = "Reported"
+            $reason = "No sign-in recorded — device created recently ($($createdDate.ToString('yyyy-MM-dd'))). Monitoring."
+        } elseif (-not $createdDate) {
+            # No creation date available — safe default, report only
+            $action = "Reported"
+            $reason = "No sign-in recorded, creation date unknown — monitoring only"
+        } else {
+            # Created before stale threshold AND never signed in — eligible
+            $action = "Disable-Eligible"
+            $reason = "No sign-in ever recorded (created $($createdDate.ToString('yyyy-MM-dd')) — older than stale threshold)"
+        }
     } else {
         $action = "Reported"
         $reason = "Inactive $StaleThreshold+ days (within grace period)"
@@ -770,6 +1067,8 @@ $staleReport = @(foreach ($d in $staleDevices) {
         TrustType         = $d.TrustType
         AccountEnabled    = $d.AccountEnabled
         LastSignIn        = $lastSignIn
+        CreatedDateTime   = $d.CreatedDateTime
+        LifecycleStamp    = Get-LifecycleStamp -Device $d
         RegisteredOwner   = $owner
         Action            = $action
         Reason            = $reason
@@ -784,13 +1083,48 @@ $reportOnlyCount      = @($staleReport | Where-Object { $_.Action -eq "Reported"
 $disableEligibleCount = @($staleReport | Where-Object { $_.Action -eq "Disable-Eligible" }).Count
 $deleteEligibleCount  = @($staleReport | Where-Object { $_.Action -eq "Delete-Eligible" }).Count
 $excludedCount        = @($staleReport | Where-Object { $_.Action -eq "Excluded" }).Count
+$reEnabledSkipCount   = @($staleReport | Where-Object { $_.Action -eq "Skipped-ReEnabled" }).Count
 
 Write-Log "  Report-only (grace period): $reportOnlyCount" -Level "INFO"
 Write-Log "  Eligible for disable: $disableEligibleCount" -Level "INFO"
 Write-Log "  Eligible for delete: $deleteEligibleCount" -Level "INFO"
 Write-Log "  Excluded (protected): $excludedCount" -Level "INFO"
+Write-Log "  Skipped (re-enabled by operator): $reEnabledSkipCount" -Level "INFO"
 
 #endregion
+
+# ─── Clear lifecycle stamps for re-enabled devices ───────────────────────────
+if ($enableReEnableProtection -and $script:stampsToClear.Count -gt 0) {
+    if (-not $Execute) {
+        Write-Log "[DRY-RUN] Would clear lifecycle stamp from $($script:stampsToClear.Count) re-enabled device(s)" -Level "DRYRUN"
+    } elseif ($PSCmdlet.ShouldProcess(
+        "$($script:stampsToClear.Count) re-enabled device(s)",
+        "Clear lifecycle stamp ($lifecycleAttribute)"
+    )) {
+        Write-Log "Clearing lifecycle stamp from $($script:stampsToClear.Count) re-enabled device(s)..." -Level "INFO"
+        $clearRequests = @()
+        $counter = 0
+        foreach ($deviceId in $script:stampsToClear) {
+            $counter++
+            $clearRequests += @{
+                id      = "clear-$counter"
+                method  = "PATCH"
+                url     = "/devices/$deviceId"
+                headers = @{ "Content-Type" = "application/json" }
+                body    = @{ extensionAttributes = @{ $lifecycleAttribute = "" } }
+            }
+        }
+
+        $clearResult = Invoke-GraphBatchRequest -Requests $clearRequests
+        Write-Log "Stamp clearing: $($clearResult.Summary.Succeeded) cleared, $($clearResult.Summary.Failed) failed" -Level "INFO"
+
+        if ($clearResult.Summary.Failed -gt 0) {
+            Write-Log "Some stamps could not be cleared — devices will be re-evaluated next run" -Level "WARN"
+        }
+    } else {
+        Write-Log "Stamp clearing skipped (-WhatIf or user declined -Confirm)" -Level "DRYRUN"
+    }
+}
 
 #region ===== STAGE 2: DISABLE =====
 
@@ -804,38 +1138,71 @@ $disabledCount = 0
 $disableFailures = 0
 
 if ($toDisable.Count -gt 0) {
-    # Build batch requests for disable (PATCH accountEnabled = false)
-    $disableRequests = [System.Collections.Generic.List[object]]::new()
+    # Build batch requests for disable (PATCH accountEnabled = false + lifecycle stamp)
+    $disableRequests = @()
     $counter = 0
+    $stamp = New-LifecycleStamp
+
     foreach ($device in $toDisable) {
         $counter++
-        $disableRequests.Add(@{
+
+        # Build PATCH body — always disable, optionally stamp
+        $patchBody = @{ accountEnabled = $false }
+        if ($enableReEnableProtection) {
+            $patchBody["extensionAttributes"] = @{ $lifecycleAttribute = $stamp }
+        }
+
+        $disableRequests += @{
             id      = "$counter"
             method  = "PATCH"
             url     = "/devices/$($device.DeviceId)"
             headers = @{ "Content-Type" = "application/json" }
-            body    = @{ accountEnabled = $false }
-        })
+            body    = $patchBody
+        }
     }
 
     if (-not $Execute) {
-        $totalBatches = [Math]::Ceiling($disableRequests.Count / $batchConfig.BatchSize)
+        $totalBatches = [math]::Ceiling($disableRequests.Count / $GraphBatch_BatchSize)
         Write-Log "[DRY-RUN] Would submit $($disableRequests.Count) disable requests in $totalBatches batch(es)" -Level "DRYRUN"
+        if ($enableReEnableProtection) {
+            Write-Log "[DRY-RUN] Would stamp $lifecycleAttribute = '$stamp' on each disabled device" -Level "DRYRUN"
+        }
         Write-Log "[DRY-RUN] No devices were actually disabled" -Level "DRYRUN"
     } else {
-        $disableResults = Invoke-GraphBatch -Requests $disableRequests
+        # ShouldProcess gate — enables -WhatIf and -Confirm support
+        if ($PSCmdlet.ShouldProcess(
+            "$($disableRequests.Count) stale device(s)",
+            "Disable (set AccountEnabled = false)"
+        )) {
+            Write-Log "Submitting $($disableRequests.Count) disable requests via GraphBatchEngine..." -Level "INFO"
+            $disableResult = Invoke-GraphBatchRequest -Requests $disableRequests
 
-        $counter = 0
-        foreach ($device in $toDisable) {
-            $counter++
-            $result = $disableResults | Where-Object { $_.Id -eq "$counter" }
-            if ($result.Success) {
-                Write-Log "DISABLED: $($device.DisplayName) ($($device.DeviceId))" -Level "ACTION"
-                $disabledCount++
-            } else {
-                Write-Log "FAILED disable $($device.DisplayName): $($result.Error)" -Level "ERROR"
-                $disableFailures++
+            $disabledCount = $disableResult.Summary.Succeeded
+            $disableFailures = $disableResult.Summary.Failed
+
+            # Log individual successes
+            foreach ($r in $disableResult.Results) {
+                $device = $toDisable[[int]$r.id - 1]
+                if ($device) {
+                    Write-Log "DISABLED: $($device.DisplayName) ($($device.DeviceId))" -Level "ACTION"
+                }
             }
+
+            # Log individual failures
+            foreach ($f in $disableResult.Failures) {
+                $device = $toDisable[[int]$f.id - 1]
+                $name = if ($device) { $device.DisplayName } else { "Unknown" }
+                Write-Log "FAILED disable ${name}: $($f.reason)" -Level "ERROR"
+            }
+
+            # Log throttle summary
+            if ($disableResult.Summary.ThrottleEvents -gt 0) {
+                Write-Log "Throttle events during disable: $($disableResult.Summary.ThrottleEvents)" -Level "WARN"
+            }
+
+            Write-Log "Disable batch complete: $disabledCount succeeded, $disableFailures failed" -Level "INFO"
+        } else {
+            Write-Log "Disable operation skipped (-WhatIf or user declined -Confirm)" -Level "DRYRUN"
         }
     }
 }
@@ -862,35 +1229,56 @@ if (-not $DeleteEnabled) {
 } else {
     if ($toDelete.Count -gt 0) {
         # Build batch requests for delete
-        $deleteRequests = [System.Collections.Generic.List[object]]::new()
+        $deleteRequests = @()
         $counter = 0
         foreach ($device in $toDelete) {
             $counter++
-            $deleteRequests.Add(@{
+            $deleteRequests += @{
                 id     = "$counter"
                 method = "DELETE"
                 url    = "/devices/$($device.DeviceId)"
-            })
+            }
         }
 
         if (-not $Execute) {
-            $totalBatches = [Math]::Ceiling($deleteRequests.Count / $batchConfig.BatchSize)
+            $totalBatches = [math]::Ceiling($deleteRequests.Count / $GraphBatch_BatchSize)
             Write-Log "[DRY-RUN] Would submit $($deleteRequests.Count) delete requests in $totalBatches batch(es)" -Level "DRYRUN"
             Write-Log "[DRY-RUN] No devices were actually deleted" -Level "DRYRUN"
         } else {
-            $deleteResults = Invoke-GraphBatch -Requests $deleteRequests
+            # ShouldProcess gate — enables -WhatIf and -Confirm support
+            if ($PSCmdlet.ShouldProcess(
+                "$($deleteRequests.Count) disabled device(s) past hold period",
+                "Delete (permanently remove from Entra ID)"
+            )) {
+                Write-Log "Submitting $($deleteRequests.Count) delete requests via GraphBatchEngine..." -Level "INFO"
+                $deleteResult = Invoke-GraphBatchRequest -Requests $deleteRequests
 
-            $counter = 0
-            foreach ($device in $toDelete) {
-                $counter++
-                $result = $deleteResults | Where-Object { $_.Id -eq "$counter" }
-                if ($result.Success) {
-                    Write-Log "DELETED: $($device.DisplayName) ($($device.DeviceId))" -Level "ACTION"
-                    $deletedCount++
-                } else {
-                    Write-Log "FAILED delete $($device.DisplayName): $($result.Error)" -Level "ERROR"
-                    $deleteFailures++
+                $deletedCount = $deleteResult.Summary.Succeeded
+                $deleteFailures = $deleteResult.Summary.Failed
+
+                # Log individual successes
+                foreach ($r in $deleteResult.Results) {
+                    $device = $toDelete[[int]$r.id - 1]
+                    if ($device) {
+                        Write-Log "DELETED: $($device.DisplayName) ($($device.DeviceId))" -Level "ACTION"
+                    }
                 }
+
+                # Log individual failures
+                foreach ($f in $deleteResult.Failures) {
+                    $device = $toDelete[[int]$f.id - 1]
+                    $name = if ($device) { $device.DisplayName } else { "Unknown" }
+                    Write-Log "FAILED delete ${name}: $($f.reason)" -Level "ERROR"
+                }
+
+                # Log throttle summary
+                if ($deleteResult.Summary.ThrottleEvents -gt 0) {
+                    Write-Log "Throttle events during delete: $($deleteResult.Summary.ThrottleEvents)" -Level "WARN"
+                }
+
+                Write-Log "Delete batch complete: $deletedCount succeeded, $deleteFailures failed" -Level "INFO"
+            } else {
+                Write-Log "Delete operation skipped (-WhatIf or user declined -Confirm)" -Level "DRYRUN"
             }
         }
     }
@@ -922,8 +1310,9 @@ $summary = @{
     ReportOnly      = $reportOnlyCount
     DisableEligible = $disableEligibleCount
     DeleteEligible  = $deleteEligibleCount
-    Excluded        = $excludedCount
-    Disabled        = $disabledCount
+    Excluded         = $excludedCount
+    ReEnabledSkipped = $reEnabledSkipCount
+    Disabled         = $disabledCount
     Deleted         = $deletedCount
     Failures        = $disableFailures + $deleteFailures
 }
